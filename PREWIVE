@@ -1,0 +1,1617 @@
+--[[
+    SPRINGTRAP MORPH v2 — LocalScript / executor, всё client side (видишь только ты)
+
+    Модель: rbxassetid://103606922923567  (грузится через game:GetObjects)
+
+    Управление (ПК)                          Телефон: кнопки справа
+      ЛКМ   — удар лапой (сносит ХП, не убивает)
+      Ctrl  — бег (зажать)
+      Z — Об землю    : хватает, 6 раз бьёт об землю и швыряет
+      X — Укус        : хватает одной рукой, подносит к пасти и кусает
+      C — Удушение    : хватает одной рукой, сжимает, сворачивает шею и отпускает (падает рэгдоллом)
+      V — Бросок      : хватает и швыряет далеко; не убивает, сносит ХП, через 30 сек игрок
+                        снова появляется там, где он реально находится
+
+    Всё локально: настоящий игрок/NPC на время прячется у тебя на клиенте, вместо него — локальный
+    клон-рэгдолл. ХП тоже локальные (полоска над целью). Никаких FireServer / InvokeServer.
+]]
+
+local CONFIG = {
+    ModelId       = 103606922923567,
+    Height        = 10,       -- рост морфа в стадах (nil = как в модели)
+    Thickness     = 1.25,     -- толщина (1 = как в модели). Если модель "поплыла" — поставь 1
+    YawFix        = 0,        -- если модель смотрит назад — поставь 180
+    ShowAxe       = true,     -- показывать топор (false = убрать совсем)
+    RunSpeed      = 30,
+    UseModelAnims = true,     -- брать Idle/Walk/Run из AnimSaves модели (если найдутся)
+    Anim          = { Idle = nil, Walk = nil, Run = nil }, -- точные имена из AnimSaves (список печатается в F9)
+    ShowButtons   = "auto",   -- true / false / "auto" (только на телефоне)
+    ThirdPerson   = true,     -- разрешить отдалять камеру, чтобы видеть морф
+    HitPlayers    = true,
+    HitNPCs       = true,
+    MaxHP         = 100,
+    ClickDamage   = 12,
+    ThrowDamage   = 40,
+    ThrowReturn   = 30,       -- через сколько сек возвращается брошенный (V)
+    KillReturn    = 60,       -- через сколько сек возвращается убитый (nil = никогда)
+}
+
+----------------------------------------------------------------------------------------------------
+-- Сервисы
+----------------------------------------------------------------------------------------------------
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local UIS          = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local Debris       = game:GetService("Debris")
+local StarterGui   = game:GetService("StarterGui")
+
+local LP = Players.LocalPlayer
+
+local genv = (typeof(getgenv) == "function" and getgenv()) or _G
+if genv.SpringtrapMorph and genv.SpringtrapMorph.Destroy then
+    pcall(genv.SpringtrapMorph.Destroy)
+end
+
+local A, rad, V3 = CFrame.Angles, math.rad, Vector3.new
+local ID = CFrame.identity
+local UP = V3(0, 1, 0)
+local ZERO = V3(0, 0, 0)
+local rng = Random.new()
+local CANCEL = {}
+
+local function lerp(a, b, t) return a + (b - a) * t end
+local function rnd(a, b) return rng:NextNumber(a, b) end
+local function flat(v)
+    local f = V3(v.X, 0, v.Z)
+    return f.Magnitude > 1e-3 and f.Unit or V3(0, 0, -1)
+end
+local function notify(text)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", { Title = "Springtrap", Text = text, Duration = 6 })
+    end)
+end
+
+local conns, morphConns = {}, {}
+local function bind(signal, fn, list)
+    local c = signal:Connect(fn)
+    table.insert(list or conns, c)
+    return c
+end
+local function disconnectAll(list)
+    for i, c in ipairs(list) do c:Disconnect(); list[i] = nil end
+end
+
+local FX = Instance.new("Folder")
+FX.Name = "SpringtrapFX"
+FX.Parent = workspace
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+local function refreshRayFilter()
+    rayParams.FilterDescendantsInstances = { FX, LP.Character }
+end
+refreshRayFilter()
+
+-- первая ДЕТАЛЬ с таким именем (суставы часто называются так же, как детали)
+local function findPart(model, name)
+    for _, d in ipairs(model:GetDescendants()) do
+        if d.Name == name and d:IsA("BasePart") then return d end
+    end
+    return nil
+end
+
+local function newPart(name, size, color, material)
+    local p = Instance.new("Part")
+    p.Name = name
+    p.Size = size
+    p.Color = color
+    p.Material = material or Enum.Material.SmoothPlastic
+    p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery = false, false, false, false
+    p.CastShadow = false
+    p.TopSurface, p.BottomSurface = Enum.SurfaceType.Smooth, Enum.SurfaceType.Smooth
+    return p
+end
+
+----------------------------------------------------------------------------------------------------
+-- Загрузка модели
+----------------------------------------------------------------------------------------------------
+local template
+do
+    local objs
+    local ok = pcall(function() objs = game:GetObjects("rbxassetid://" .. CONFIG.ModelId) end)
+    if not ok or type(objs) ~= "table" or not objs[1] then
+        pcall(function()
+            objs = { game:GetService("InsertService"):LoadLocalAsset("rbxassetid://" .. CONFIG.ModelId) }
+        end)
+    end
+    local m = type(objs) == "table" and objs[1]
+    if m and not m:FindFirstChild("HumanoidRootPart") then
+        for _, d in ipairs(m:GetDescendants()) do
+            if d:IsA("Model") and d:FindFirstChild("HumanoidRootPart") then m = d break end
+        end
+    end
+    if not m or not m:FindFirstChild("HumanoidRootPart") then
+        FX:Destroy()
+        notify("Не удалось загрузить модель (нужен экзекутор с game:GetObjects)")
+        error("[Springtrap] модель " .. CONFIG.ModelId .. " не загрузилась")
+    end
+    template = m
+end
+
+----------------------------------------------------------------------------------------------------
+-- Риг: суставы Motor6D + оси, выровненные по корню (X вправо, Y вверх, -Z вперёд)
+----------------------------------------------------------------------------------------------------
+local function buildRig(model, root)
+    local motors = {}
+    for _, m in ipairs(model:GetDescendants()) do
+        if m:IsA("Motor6D") and m.Part0 and m.Part1 and m.Part0 ~= m.Part1 then
+            table.insert(motors, m)
+        end
+    end
+    local rest = { [root] = ID } -- поза покоя детали относительно корня
+    local joints, list, used = {}, {}, {}
+    local progress = true
+    while progress do
+        progress = false
+        for _, m in ipairs(motors) do
+            if not used[m] then
+                local p0, p1 = m.Part0, m.Part1
+                local j
+                if rest[p0] and not rest[p1] then
+                    local jf = rest[p0] * m.C0
+                    rest[p1] = jf * m.C1:Inverse()
+                    j = { motor = m, part = p1, parent = p0, Q = jf.Rotation, pivot = jf.Position, reversed = false }
+                elseif rest[p1] and not rest[p0] then
+                    local jf = rest[p1] * m.C1
+                    rest[p0] = jf * m.C0:Inverse()
+                    j = { motor = m, part = p0, parent = p1, Q = jf.Rotation, pivot = jf.Position, reversed = true }
+                elseif rest[p0] and rest[p1] then
+                    used[m] = true
+                end
+                if j then
+                    j.Qi = j.Q:Inverse()
+                    j.name = j.part.Name
+                    used[m] = true
+                    progress = true
+                    if not joints[j.name] then joints[j.name] = j end
+                    table.insert(list, j)
+                end
+            end
+        end
+    end
+    return { joints = joints, list = list, rest = rest, root = root }
+end
+
+-- R — поворот в осях корня; возвращает значение для Motor6D.Transform
+local function toRaw(j, R)
+    if j.reversed then return j.Qi * R:Inverse() * j.Q end
+    return j.Qi * R * j.Q
+end
+
+-- Если в модели нет Motor6D — собираем риг сами по именам костей
+local DEFAULT_TREE = {
+    { "LowerTorso", "HumanoidRootPart" }, { "SpringTorso", "LowerTorso" }, { "Head", "SpringTorso" },
+    { "LeftArm", "SpringTorso" }, { "LeftArmLower", "LeftArm" }, { "HandLeft", "LeftArmLower" },
+    { "RightArm", "SpringTorso" }, { "RightArmLower", "RightArm" }, { "HandRight", "RightArmLower" },
+    { "LeftLeg", "LowerTorso" }, { "LeftLowerLeg", "LeftLeg" }, { "KneecapLeft", "LeftLowerLeg" },
+    { "RightLeg", "LowerTorso" }, { "RightLowerLeg", "RightLeg" }, { "Fire Axe", "HandRight" },
+}
+local function ensureMotors(model, root)
+    local count = 0
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("Motor6D") then count += 1 end
+    end
+    if count >= 6 then return end
+    warn("[Springtrap] в модели нет Motor6D — собираю риг по именам костей")
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("JointInstance") or d:IsA("WeldConstraint") then d:Destroy() end
+    end
+    local rot = root.CFrame.Rotation
+    for _, pair in ipairs(DEFAULT_TREE) do
+        local child, parent = findPart(model, pair[1]), findPart(model, pair[2])
+        if child and parent then
+            local lp = child.CFrame:PointToObjectSpace(parent.Position)
+            local h = child.Size / 2
+            lp = V3(math.clamp(lp.X, -h.X, h.X), math.clamp(lp.Y, -h.Y, h.Y), math.clamp(lp.Z, -h.Z, h.Z))
+            local jf = CFrame.new(child.CFrame:PointToWorldSpace(lp)) * rot
+            local m = Instance.new("Motor6D")
+            m.Name = pair[1]
+            m.Part0, m.Part1 = parent, child
+            m.C0, m.C1 = parent.CFrame:ToObjectSpace(jf), child.CFrame:ToObjectSpace(jf)
+            m.Parent = parent
+        end
+    end
+end
+
+-- Сделать модель толще: растягиваем детали и суставы по горизонтали (оси X/Z корня)
+local function fatten(model, root, w)
+    if not w or math.abs(w - 1) < 0.01 then return end
+    local rootCF = root.CFrame
+    local factors = {}
+    local function f(d) return math.sqrt((w * d.X) ^ 2 + d.Y ^ 2 + (w * d.Z) ^ 2) end
+    for _, p in ipairs(model:GetDescendants()) do
+        if p:IsA("BasePart") then
+            local rel = rootCF:ToObjectSpace(p.CFrame)
+            factors[p] = V3(f(rel.XVector), f(rel.YVector), f(rel.ZVector))
+        end
+    end
+    for p, k in pairs(factors) do
+        if p ~= root then
+            p.Size = p.Size * k
+            for _, m in ipairs(p:GetChildren()) do
+                if m:IsA("SpecialMesh") and m.MeshType == Enum.MeshType.FileMesh then m.Scale = m.Scale * k end
+            end
+        end
+    end
+    for _, j in ipairs(model:GetDescendants()) do
+        if j:IsA("JointInstance") then
+            local k0, k1 = j.Part0 and factors[j.Part0], j.Part1 and factors[j.Part1]
+            if k0 then j.C0 = CFrame.new(j.C0.Position * k0) * j.C0.Rotation end
+            if k1 then j.C1 = CFrame.new(j.C1.Position * k1) * j.C1.Rotation end
+        end
+    end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Анимации из AnimSaves (KeyframeSequence) — свой проигрыватель
+----------------------------------------------------------------------------------------------------
+local ModelAnims = {} -- Idle / Walk / Run -> {tracks, length}
+local animsPrinted = false
+
+local function parseKFS(kfs, scale)
+    local kfList = {}
+    for _, kf in ipairs(kfs:GetChildren()) do
+        if kf:IsA("Keyframe") then table.insert(kfList, kf) end
+    end
+    if #kfList < 2 then return nil end
+    table.sort(kfList, function(a, b) return a.Time < b.Time end)
+    local tracks, length = {}, 0
+    for _, kf in ipairs(kfList) do
+        length = math.max(length, kf.Time)
+        for _, p in ipairs(kf:GetDescendants()) do
+            if p:IsA("Pose") and p.Weight > 0 then
+                local tr = tracks[p.Name]
+                if not tr then tr = {}; tracks[p.Name] = tr end
+                local cf = p.CFrame
+                table.insert(tr, { t = kf.Time, cf = CFrame.new(cf.Position * scale) * cf.Rotation })
+            end
+        end
+    end
+    return { tracks = tracks, length = math.max(length, 0.05), name = kfs.Name }
+end
+
+local function sampleKFS(anim, name, t)
+    local tr = anim.tracks[name]
+    if not tr then return nil end
+    local n = #tr
+    if n == 1 or t <= tr[1].t then return tr[1].cf end
+    if t >= tr[n].t then return tr[n].cf end
+    local lo, hi = 1, n
+    while hi - lo > 1 do
+        local mid = (lo + hi) // 2
+        if tr[mid].t <= t then lo = mid else hi = mid end
+    end
+    local a, b = tr[lo], tr[hi]
+    return a.cf:Lerp(b.cf, (t - a.t) / math.max(b.t - a.t, 1e-4))
+end
+
+local function loadModelAnims(scale)
+    table.clear(ModelAnims)
+    if not CONFIG.UseModelAnims then return end
+    local saves = template:FindFirstChild("AnimSaves", true)
+    if not saves then return end
+    local all = {}
+    for _, k in ipairs(saves:GetDescendants()) do
+        if k:IsA("KeyframeSequence") then table.insert(all, k) end
+    end
+    if not animsPrinted then
+        animsPrinted = true
+        print(("[Springtrap] анимаций в AnimSaves: %d"):format(#all))
+        for _, k in ipairs(all) do print("      " .. k.Name) end
+    end
+    local function pick(exact, keys)
+        if exact then
+            for _, k in ipairs(all) do
+                if k.Name == exact then return k end
+            end
+            return nil
+        end
+        for _, key in ipairs(keys) do
+            for _, k in ipairs(all) do
+                if k.Name:lower():find(key, 1, true) then return k end
+            end
+        end
+    end
+    local map = {
+        Idle = pick(CONFIG.Anim.Idle, { "idle", "stand" }),
+        Walk = pick(CONFIG.Anim.Walk, { "walk" }),
+        Run  = pick(CONFIG.Anim.Run, { "run", "sprint", "chase" }),
+    }
+    for state, k in pairs(map) do
+        local ok, anim = pcall(parseKFS, k, scale)
+        if ok and anim then ModelAnims[state] = anim end
+    end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Эффекты (пыль, тряска камеры)
+----------------------------------------------------------------------------------------------------
+local shakeMag, shakeEnd, shakeDur = 0, 0, 0.01
+local function shake(mag, dur)
+    shakeMag, shakeDur, shakeEnd = mag, dur, os.clock() + dur
+end
+
+local function discCF(pos, n)
+    local ref = math.abs(n.Y) > 0.99 and V3(1, 0, 0) or UP
+    local t1 = n:Cross(ref).Unit
+    return CFrame.fromMatrix(pos, n, t1, n:Cross(t1)) -- ось X цилиндра = нормаль
+end
+
+-- кольцо пыли по земле
+local function dustRing(pos, radius, time)
+    local ray = workspace:Raycast(pos + V3(0, 2, 0), V3(0, -16, 0), rayParams)
+    local p, n = ray and ray.Position or pos, ray and ray.Normal or UP
+    local d = newPart("Dust", V3(0.12, 2, 2), Color3.fromRGB(175, 165, 150))
+    d.Shape = Enum.PartType.Cylinder
+    d.Anchored = true
+    d.Transparency = 0.45
+    d.CFrame = discCF(p + n * 0.1, n)
+    d.Parent = FX
+    TweenService:Create(d, TweenInfo.new(time or 0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        { Size = V3(0.12, radius * 2, radius * 2), Transparency = 1 }):Play()
+    Debris:AddItem(d, (time or 0.45) + 0.1)
+
+    local att = Instance.new("Attachment")
+    att.Parent = workspace.Terrain
+    att.WorldPosition = p + n * 0.5
+    local e = Instance.new("ParticleEmitter")
+    e.Texture = "rbxasset://textures/particles/smoke_main.dds"
+    e.Color = ColorSequence.new(Color3.fromRGB(170, 160, 145))
+    e.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1.2), NumberSequenceKeypoint.new(1, 4) })
+    e.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.5), NumberSequenceKeypoint.new(1, 1) })
+    e.Lifetime = NumberRange.new(0.4, 0.9)
+    e.Speed = NumberRange.new(6, 14)
+    e.SpreadAngle = Vector2.new(85, 85)
+    e.Rotation = NumberRange.new(0, 360)
+    e.Enabled = false
+    e.Parent = att
+    e:Emit(10)
+    Debris:AddItem(att, 1.5)
+end
+
+local function fling(part, vel, ang)
+    ang = ang or rng:NextUnitVector() * rnd(4, 12)
+    local function apply()
+        if part.Parent then
+            part.AssemblyLinearVelocity = vel
+            part.AssemblyAngularVelocity = ang
+        end
+    end
+    apply()
+    task.delay(0.05, apply)
+end
+
+----------------------------------------------------------------------------------------------------
+-- Цели: локальные ХП, скрытие настоящего персонажа, локальный клон-рэгдолл
+----------------------------------------------------------------------------------------------------
+local hidden = {}  -- [настоящий персонаж] = {restore, reapply, clone, returnAt, lethal}
+local hpRec = {}   -- [настоящий персонаж] = {v, bb, fill, root}
+local runCtx, busy = nil, false
+
+local function hpOf(t)
+    local r = hpRec[t.char]
+    if not r then
+        local bb = Instance.new("BillboardGui")
+        bb.Size = UDim2.new(4, 0, 0.45, 0)
+        bb.StudsOffsetWorldSpace = V3(0, 3.6, 0)
+        bb.AlwaysOnTop = true
+        bb.Adornee = t.root
+        bb.Enabled = false
+        local bg = Instance.new("Frame")
+        bg.Size = UDim2.new(1, 0, 1, 0)
+        bg.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+        bg.BorderSizePixel = 0
+        bg.Parent = bb
+        local fill = Instance.new("Frame")
+        fill.Size = UDim2.new(1, 0, 1, 0)
+        fill.BorderSizePixel = 0
+        fill.Parent = bg
+        bb.Parent = FX
+        r = { v = CONFIG.MaxHP, bb = bb, fill = fill, root = t.root }
+        hpRec[t.char] = r
+    end
+    return r
+end
+
+local function refreshBar(r)
+    local k = math.clamp(r.v / CONFIG.MaxHP, 0, 1)
+    r.fill.Size = UDim2.new(k, 0, 1, 0)
+    r.fill.BackgroundColor3 = Color3.fromRGB(255 * (1 - k), 40 + 180 * k, 40)
+    r.bb.Enabled = r.v < CONFIG.MaxHP
+end
+
+-- снять ХП (lethal = можно до нуля; иначе минимум 1)
+local function damage(t, amount, lethal)
+    local r = hpOf(t)
+    r.v = math.max(lethal and 0 or 1, r.v - amount)
+    refreshBar(r)
+    local adornee = r.bb.Adornee
+    if adornee and adornee.Parent then
+        local pop = Instance.new("BillboardGui")
+        pop.Size = UDim2.new(3, 0, 1.1, 0)
+        pop.StudsOffsetWorldSpace = V3(rnd(-1, 1), 4.6, 0)
+        pop.AlwaysOnTop = true
+        pop.Adornee = adornee
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, 0, 1, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = "-" .. tostring(math.floor(amount))
+        lbl.TextScaled = true
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextColor3 = Color3.fromRGB(255, 80, 60)
+        lbl.TextStrokeTransparency = 0.3
+        lbl.Parent = pop
+        pop.Parent = FX
+        TweenService:Create(pop, TweenInfo.new(0.7), { StudsOffsetWorldSpace = pop.StudsOffsetWorldSpace + V3(0, 2.2, 0) }):Play()
+        TweenService:Create(lbl, TweenInfo.new(0.7), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+        Debris:AddItem(pop, 0.8)
+    end
+end
+
+local function flash(model)
+    local hl = Instance.new("Highlight")
+    hl.Adornee = model
+    hl.FillColor, hl.FillTransparency = Color3.fromRGB(255, 255, 255), 0.35
+    hl.OutlineTransparency = 1
+    hl.Parent = FX
+    Debris:AddItem(hl, 0.12)
+end
+
+local function hideReal(char)
+    if hidden[char] then return hidden[char] end
+    local saved, list = {}, {}
+    local function hide(d)
+        if d:IsA("BasePart") then
+            d.LocalTransparencyModifier = 1
+        elseif d:IsA("Decal") or d:IsA("Texture") then
+            saved[d] = { "Transparency", d.Transparency }
+            d.Transparency = 1
+        elseif d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") or d:IsA("Fire") or d:IsA("Smoke")
+            or d:IsA("Sparkles") or d:IsA("Light") or d:IsA("BillboardGui") or d:IsA("SurfaceGui") or d:IsA("Highlight") then
+            saved[d] = { "Enabled", d.Enabled }
+            d.Enabled = false
+        elseif d:IsA("Humanoid") then
+            saved[d] = { "DisplayDistanceType", d.DisplayDistanceType }
+            d.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+        elseif d:IsA("Sound") then
+            saved[d] = { "Volume", d.Volume }
+            d.Volume = 0
+        end
+    end
+    for _, d in ipairs(char:GetDescendants()) do pcall(hide, d) end
+    bind(char.DescendantAdded, function(d) pcall(hide, d) end, list)
+    local rec = {
+        returnAt = os.clock() + 120,
+        reapply = function()
+            for _, d in ipairs(char:GetDescendants()) do
+                if d:IsA("BasePart") then d.LocalTransparencyModifier = 1 end
+            end
+        end,
+        restore = function()
+            disconnectAll(list)
+            for _, d in ipairs(char:GetDescendants()) do
+                if d:IsA("BasePart") then d.LocalTransparencyModifier = 0 end
+            end
+            for inst, pv in pairs(saved) do
+                pcall(function() inst[pv[1]] = pv[2] end)
+            end
+        end,
+    }
+    hidden[char] = rec
+    return rec
+end
+
+-- вернуть настоящего персонажа (появляется там, где он реально находится)
+local function bringBack(char)
+    local rec = hidden[char]
+    if not rec then return end
+    hidden[char] = nil
+    pcall(rec.restore)
+    if rec.clone and rec.clone.model.Parent then rec.clone.model:Destroy() end
+    local r = hpRec[char]
+    if r then
+        if rec.lethal then r.v = CONFIG.MaxHP end
+        r.bb.Adornee = r.root
+        refreshBar(r)
+    end
+end
+
+local function buildDummy()
+    local m = Instance.new("Model")
+    local skin = Color3.fromRGB(204, 170, 140)
+    local function P_(name, size, color)
+        local p = newPart(name, size, color)
+        p.Parent = m
+        return p
+    end
+    local function J(name, p0, p1, c0, c1)
+        local j = Instance.new("Motor6D")
+        j.Name, j.Part0, j.Part1, j.C0, j.C1 = name, p0, p1, c0, c1
+        j.Parent = p0
+    end
+    local root = P_("HumanoidRootPart", V3(2, 2, 1), skin)
+    root.Transparency = 1
+    local torso = P_("Torso", V3(2, 2, 1), Color3.fromRGB(70, 90, 140))
+    J("RootJoint", root, torso, ID, ID)
+    J("Neck", torso, P_("Head", V3(1.2, 1.2, 1.2), skin), CFrame.new(0, 1, 0), CFrame.new(0, -0.6, 0))
+    J("Left Shoulder", torso, P_("Left Arm", V3(1, 2, 1), skin), CFrame.new(-1, 0.9, 0), CFrame.new(0.5, 0.9, 0))
+    J("Right Shoulder", torso, P_("Right Arm", V3(1, 2, 1), skin), CFrame.new(1, 0.9, 0), CFrame.new(-0.5, 0.9, 0))
+    J("Left Hip", torso, P_("Left Leg", V3(1, 2, 1), Color3.fromRGB(50, 50, 60)), CFrame.new(-0.5, -1, 0), CFrame.new(0, 1, 0))
+    J("Right Hip", torso, P_("Right Leg", V3(1, 2, 1), Color3.fromRGB(50, 50, 60)), CFrame.new(0.5, -1, 0), CFrame.new(0, 1, 0))
+    m.PrimaryPart = root
+    return m
+end
+
+local Clone = {}
+Clone.__index = Clone
+
+local function newClone(char)
+    local clone
+    pcall(function()
+        char.Archivable = true
+        for _, d in ipairs(char:GetDescendants()) do d.Archivable = true end
+        clone = char:Clone()
+    end)
+    if not clone or not clone:FindFirstChildWhichIsA("BasePart", true) then clone = buildDummy() end
+    clone.Name = "Grabbed"
+
+    for _, d in ipairs(clone:GetDescendants()) do
+        if d:IsA("LuaSourceContainer") or d:IsA("Sound") or d:IsA("ForceField") or d:IsA("BodyMover")
+            or d:IsA("Animator") or d:IsA("BillboardGui") or d:IsA("Highlight") or d:IsA("ProximityPrompt")
+            or d:IsA("Constraint") then
+            d:Destroy()
+        end
+    end
+    local hum = clone:FindFirstChildOfClass("Humanoid")
+    if hum then
+        pcall(function() hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None end)
+        pcall(function() hum.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff end)
+        pcall(function() hum.BreakJointsOnDeath = false; hum.RequiresNeck = false end)
+        pcall(function() hum.EvaluateStateMachine = false end)
+        pcall(function() hum.PlatformStand = true; hum:ChangeState(Enum.HumanoidStateType.Physics) end)
+    end
+
+    local root = clone:FindFirstChild("HumanoidRootPart") or clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart", true)
+    for _, p in ipairs(clone:GetDescendants()) do
+        if p:IsA("BasePart") then
+            p.Anchored = (p == root)
+            p.CanCollide, p.CanTouch, p.CanQuery = false, false, false
+            p.LocalTransparencyModifier = 0
+        end
+    end
+
+    local self = setmetatable({ model = clone, root = root, mode = "up", follow = 18, jitter = 0 }, Clone)
+    self.rig = buildRig(clone, root)
+    local head = clone:FindFirstChild("Head")
+    self.head = (head and head:IsA("BasePart")) and head or nil
+    local torso = clone:FindFirstChild("UpperTorso") or clone:FindFirstChild("Torso")
+    self.torso = (torso and torso:IsA("BasePart")) and torso or root
+    self.arms, self.legs = {}, {}
+    for _, j in ipairs(self.rig.list) do
+        local n, pn = j.name:lower(), j.parent.Name:lower()
+        if pn:find("torso") and not n:find("torso") and not n:find("root") then
+            if n:find("head") then
+                self.headJ = j
+            elseif n:find("arm") then
+                table.insert(self.arms, j)
+            elseif n:find("leg") then
+                table.insert(self.legs, j)
+            end
+        end
+    end
+
+    clone:PivotTo(char:GetPivot())
+    clone.Parent = FX
+    return self
+end
+
+function Clone:ragdoll()
+    for _, j in ipairs(self.rig.list) do
+        local m = j.motor
+        if m.Parent and m.Part0 ~= self.root and m.Part1 ~= self.root then
+            local a0, a1 = Instance.new("Attachment"), Instance.new("Attachment")
+            a0.CFrame, a1.CFrame = m.C0, m.C1
+            a0.Parent, a1.Parent = m.Part0, m.Part1
+            local bs = Instance.new("BallSocketConstraint")
+            bs.Attachment0, bs.Attachment1 = a0, a1
+            bs.LimitsEnabled, bs.UpperAngle = true, 55
+            bs.TwistLimitsEnabled, bs.TwistLowerAngle, bs.TwistUpperAngle = true, -35, 35
+            bs.Parent = m.Part0
+            local nc = Instance.new("NoCollisionConstraint")
+            nc.Part0, nc.Part1 = m.Part0, m.Part1
+            nc.Parent = m.Part0
+            m:Destroy()
+        end
+    end
+end
+
+-- отпустить: клон становится рэгдоллом и летит со скоростью vel
+function Clone:release(vel)
+    if self.released then return end
+    self.released = true
+    if not self.model.Parent then return end
+    self:ragdoll()
+    for _, p in ipairs(self.model:GetDescendants()) do
+        if p:IsA("BasePart") and p ~= self.root and p.Size.Magnitude > 0.9 then
+            p.CanCollide = true
+        end
+    end
+    self.root.Anchored = false
+    fling(self.torso.Parent and self.torso or self.root, vel or ZERO)
+end
+
+-- Список целей (игроки + NPC)
+local npcCache, npcScanAt = {}, 0
+local function allTargets()
+    local list, seen = {}, {}
+    local myChar = LP.Character
+    local function add(model, hum)
+        if seen[model] or hidden[model] or model == myChar or not model.Parent or model:IsDescendantOf(FX) then return end
+        if hum.Health <= 0 then return end
+        local root = hum.RootPart or model.PrimaryPart or model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
+        if not root then return end
+        seen[model] = true
+        table.insert(list, { char = model, hum = hum, root = root })
+    end
+    if CONFIG.HitPlayers then
+        for _, pl in ipairs(Players:GetPlayers()) do
+            local ch = pl ~= LP and pl.Character
+            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+            if hum then add(ch, hum) end
+        end
+    end
+    if CONFIG.HitNPCs then
+        if os.clock() - npcScanAt > 1.5 then
+            npcScanAt = os.clock()
+            table.clear(npcCache)
+            for _, d in ipairs(workspace:GetDescendants()) do
+                if d:IsA("Humanoid") and d.Parent and d.Parent:IsA("Model") and not Players:GetPlayerFromCharacter(d.Parent) then
+                    table.insert(npcCache, d)
+                end
+            end
+        end
+        for _, hum in ipairs(npcCache) do
+            if hum.Parent then add(hum.Parent, hum) end
+        end
+    end
+    return list
+end
+
+-- схватить цель: прячем настоящего, возвращаем локальный клон
+local function grab(t)
+    if not t or hidden[t.char] or not t.char.Parent then return nil end
+    local ok, c = pcall(newClone, t.char)
+    if not ok then warn("[Springtrap] клон: " .. tostring(c)) return nil end
+    local rec = hideReal(t.char)
+    rec.clone = c
+    c.target = t
+    hpOf(t).bb.Adornee = c.torso
+    if runCtx and busy then table.insert(runCtx.clones, c) end
+    return c
+end
+
+-- назначить, когда цель вернётся (lethal = была убита → вернётся с полным ХП)
+local function finish(c, lethal, delay)
+    local rec = hidden[c.target.char]
+    if not rec then return end
+    rec.lethal = lethal
+    if delay then
+        rec.returnAt = os.clock() + delay
+    else
+        rec.returnAt = nil
+        Debris:AddItem(c.model, 300)
+    end
+end
+
+----------------------------------------------------------------------------------------------------
+-- Морф
+----------------------------------------------------------------------------------------------------
+local Morph = nil
+local GR, OT = "Right", "Left"         -- рука, которой хватает / вторая
+local SGN = { Right = 1, Left = -1 }
+local fix, spineMode = {}, "A"
+
+local cur, bodyCur = {}, ID
+local override, overrideBody, overrideSpeed = nil, nil, 12
+local phase, animT, kTime, runAmt = 0, 0, 0, 0
+local nextTwitch, twitchEnd, twitchVal = 3, 0, 0
+local sprinting, frozen, baseSpeed = false, false, 16
+local hiddenOwn = {}
+local savedCam = {}
+
+local function arm(pitch, yawIn, out, side)
+    return A(0, yawIn * side, 0) * A(pitch, 0, 0) * A(0, 0, out * side)
+end
+
+local function expand(L)
+    local rig = Morph.rig
+    local raw = {}
+    for name, R in pairs(L) do
+        if name == "Spine" then
+            local j = rig.joints.SpringTorso
+            if j then raw.SpringTorso = toRaw(j, R) end
+            if spineMode == "B" and rig.joints.LowerTorso then
+                raw.LowerTorso = toRaw(rig.joints.LowerTorso, R:Inverse())
+            end
+        elseif name ~= "Body" then
+            local j = rig.joints[name]
+            if j then raw[name] = toRaw(j, R * (fix[name] or ID)) end
+        end
+    end
+    return raw, L.Body
+end
+
+local function procLoco(t, ph, mv, run, air)
+    local s, c = math.sin(ph), math.cos(ph)
+    local L = {}
+    if air then
+        L.LeftLeg, L.RightLeg = A(rad(22), 0, 0), A(rad(-12), 0, 0)
+        L.LeftLowerLeg, L.RightLowerLeg = A(rad(-35), 0, 0), A(rad(-20), 0, 0)
+        L.LeftArm, L.RightArm = arm(rad(-10), 0, rad(28), -1), arm(rad(-10), 0, rad(28), 1)
+        L.LeftArmLower, L.RightArmLower = A(rad(20), 0, 0), A(rad(20), 0, 0)
+        L.Spine = A(rad(-6), 0, 0)
+        return L
+    end
+    local idle = 1 - mv
+    local legSw = rad(lerp(24, 46, run)) * mv
+    local knee = rad(lerp(40, 80, run)) * mv
+    local armSw = rad(lerp(16, 42, run)) * mv
+    local elbow = rad(10 + lerp(8, 55, run) * mv)
+    local lean = rad(4 + lerp(4, 15, run) * mv + 1.5 * math.sin(t * 1.4) * idle)
+    L.LeftLeg, L.RightLeg = A(legSw * s, 0, 0), A(-legSw * s, 0, 0)
+    L.LeftLowerLeg = A(-knee * math.max(0, c) - rad(3), 0, 0)
+    L.RightLowerLeg = A(-knee * math.max(0, -c) - rad(3), 0, 0)
+    L.LeftArm, L.RightArm = arm(-armSw * s, 0, rad(9), -1), arm(armSw * s, 0, rad(9), 1)
+    L.LeftArmLower, L.RightArmLower = A(elbow, 0, 0), A(elbow, 0, 0)
+    L.Spine = A(-lean, rad(5) * s * mv, rad(2.5) * c * mv) -- тяжёлая походка: корпус качается
+    L.Head = A(lean * 0.7, rad(7) * math.sin(t * 0.5) * idle, (t < twitchEnd) and twitchVal or 0)
+    local bob = (0.06 + 0.1 * run) * (Morph.height / 7) * mv * (0.5 - 0.5 * math.cos(ph * 2))
+    L.Body = CFrame.new(0, -bob, 0)
+    return L
+end
+
+local function updateAnim(dt)
+    local M = Morph
+    local vel = M.hrp.AssemblyLinearVelocity
+    local speed = V3(vel.X, 0, vel.Z).Magnitude
+    local air = M.hum.FloorMaterial == Enum.Material.Air
+    local mv = math.clamp(speed / 6, 0, 1)
+    runAmt += (((sprinting and speed > 18) and 1 or 0) - runAmt) * math.min(1, dt * 6)
+    phase += dt * speed * lerp(0.42, 0.3, runAmt) * (7 / M.height)
+    animT += dt
+    if animT > nextTwitch then
+        twitchEnd, twitchVal, nextTwitch = animT + 0.12, rad(rnd(-20, 20)), animT + rnd(2.5, 6)
+    end
+
+    local raw, body
+    local state = (mv < 0.15) and "Idle" or (runAmt > 0.5 and "Run" or "Walk")
+    local anim = ModelAnims[state] or (state == "Run" and ModelAnims.Walk) or nil
+    if anim and not air then
+        local rate = 1
+        if state ~= "Idle" then
+            local ref = (state == "Run" and ModelAnims.Run) and CONFIG.RunSpeed or 16
+            rate = math.clamp(speed / ref, 0.5, 2.2)
+        end
+        kTime = (kTime + dt * rate) % anim.length
+        raw = {}
+        for name in pairs(M.rig.joints) do
+            raw[name] = sampleKFS(anim, name, kTime)
+        end
+    else
+        raw, body = expand(procLoco(animT, phase, mv, runAmt, air))
+    end
+
+    local aLoco = 1 - math.exp(-dt * 16)
+    local aOv = 1 - math.exp(-dt * overrideSpeed)
+    for name, j in pairs(M.rig.joints) do
+        local target, a
+        if override and override[name] then
+            target, a = override[name], aOv
+        else
+            target, a = raw[name] or ID, aLoco
+        end
+        local c = (cur[name] or ID):Lerp(target, a)
+        cur[name] = c
+        j.motor.Transform = c
+    end
+    if override and overrideBody then
+        bodyCur = bodyCur:Lerp(overrideBody, aOv)
+    else
+        bodyCur = bodyCur:Lerp(body or ID, aLoco)
+    end
+    M.mount.C0 = M.baseMount * bodyCur
+end
+
+local function hideOwn(char)
+    local function h(d)
+        if d:FindFirstAncestorOfClass("Tool") then return end
+        if (d:IsA("BasePart") or d:IsA("Decal") or d:IsA("Texture")) and hiddenOwn[d] == nil then
+            hiddenOwn[d] = d.Transparency
+            d.Transparency = 1
+        end
+    end
+    for _, d in ipairs(char:GetDescendants()) do h(d) end
+    bind(char.DescendantAdded, h, morphConns)
+end
+
+local function destroyMorph()
+    disconnectAll(morphConns)
+    for inst, tr in pairs(hiddenOwn) do
+        pcall(function() inst.Transparency = tr end)
+    end
+    table.clear(hiddenOwn)
+    if Morph then
+        pcall(function()
+            Morph.hum.CameraOffset = savedCam.offset or ZERO
+            if frozen or sprinting then Morph.hum.WalkSpeed = baseSpeed end
+            if frozen then
+                Morph.hum.JumpPower = Morph.savedJP or Morph.hum.JumpPower
+                Morph.hum.JumpHeight = Morph.savedJH or Morph.hum.JumpHeight
+            end
+        end)
+        if savedCam.max then
+            pcall(function() LP.CameraMaxZoomDistance = savedCam.max; LP.CameraMode = savedCam.mode end)
+        end
+        Morph.model:Destroy()
+    end
+    Morph = nil
+    override, overrideBody = nil, nil
+    frozen, sprinting = false, false
+    table.clear(cur)
+    bodyCur = ID
+end
+
+local function createMorph(char)
+    destroyMorph()
+    local hum = char:WaitForChild("Humanoid", 10)
+    local hrp = char:WaitForChild("HumanoidRootPart", 10)
+    if not (hum and hrp) then return end
+    refreshRayFilter()
+
+    local model = template:Clone()
+    model.Name = "SpringtrapMorph"
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("Humanoid") or d:IsA("LuaSourceContainer") or d.Name == "AnimSaves" or d:IsA("BodyMover")
+            or d:IsA("Sound") or d:IsA("Animator") or d:IsA("AnimationController") then
+            d:Destroy()
+        end
+    end
+    local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+
+    -- топор
+    local axe
+    for _, d in ipairs(model:GetDescendants()) do
+        if (d:IsA("BasePart") or d:IsA("Model") or d:IsA("Tool")) and d.Name:lower():find("axe") then
+            axe = d
+            break
+        end
+    end
+    local axeParts = {}
+    if axe then
+        if axe:IsA("BasePart") then table.insert(axeParts, axe) end
+        for _, d in ipairs(axe:GetDescendants()) do
+            if d:IsA("BasePart") then table.insert(axeParts, d) end
+        end
+        if not CONFIG.ShowAxe or #axeParts == 0 then
+            axe:Destroy()
+            axe, axeParts = nil, {}
+        end
+    end
+    local axeMain = axeParts[1]
+    local isAxe = {}
+    for _, p in ipairs(axeParts) do isAxe[p] = true end
+
+    -- габариты в осях корня
+    local function extents()
+        local minY, maxY = math.huge, -math.huge
+        for _, p in ipairs(model:GetDescendants()) do
+            if p:IsA("BasePart") and p ~= root and not isAxe[p] then
+                local rel = root.CFrame:ToObjectSpace(p.CFrame)
+                local s = p.Size
+                local hy = 0.5 * (math.abs(rel.XVector.Y) * s.X + math.abs(rel.YVector.Y) * s.Y + math.abs(rel.ZVector.Y) * s.Z)
+                minY, maxY = math.min(minY, rel.Position.Y - hy), math.max(maxY, rel.Position.Y + hy)
+            end
+        end
+        return minY, maxY
+    end
+    local minY, maxY = extents()
+    local scale = 1
+    if CONFIG.Height and maxY > minY then
+        scale = CONFIG.Height / (maxY - minY)
+        local ok = pcall(function() model:ScaleTo(model:GetScale() * scale) end)
+        if ok then minY, maxY = extents() else scale = 1 end
+    end
+    loadModelAnims(scale)
+
+    for _, p in ipairs(model:GetDescendants()) do
+        if p:IsA("BasePart") then
+            p.Anchored, p.CanCollide, p.CanTouch, p.CanQuery, p.Massless = false, false, false, false, true
+        end
+    end
+    root.Transparency = 1
+
+    ensureMotors(model, root)
+
+    local function hand(side)
+        return findPart(model, "Hand" .. side) or findPart(model, side .. "ArmLower")
+            or findPart(model, side .. "Arm") or root
+    end
+
+    -- в какой руке топор; если он ни к чему не прикреплён — крепим к ближайшей кисти
+    local axeSide = nil
+    if axeMain then
+        local l, r = hand("Left"), hand("Right")
+        local dl, dr = (axeMain.Position - l.Position).Magnitude, (axeMain.Position - r.Position).Magnitude
+        axeSide = dl < dr and "Left" or "Right"
+        local wasHidden = false
+        for _, p in ipairs(axeParts) do
+            if p.Transparency >= 0.99 then
+                p.Transparency = 0
+                wasHidden = true
+            end
+        end
+        local attachedTo
+        for _, d in ipairs(model:GetDescendants()) do
+            if (d:IsA("JointInstance") or d:IsA("WeldConstraint")) and d.Part0 and d.Part1
+                and (isAxe[d.Part0] ~= isAxe[d.Part1]) then
+                attachedTo = isAxe[d.Part0] and d.Part1 or d.Part0
+                break
+            end
+        end
+        if not attachedTo then
+            local h = hand(axeSide)
+            if math.min(dl, dr) < (maxY - minY) * 0.4 then
+                local wc = Instance.new("WeldConstraint")
+                wc.Part0, wc.Part1 = h, axeMain
+                wc.Parent = axeMain
+            else
+                local w = Instance.new("Weld")
+                w.Part0, w.Part1 = h, axeMain
+                w.Parent = axeMain
+            end
+            attachedTo = h
+        end
+        print(("[Springtrap] топор: найден (%s), был невидимым: %s, прикреплён к %s"):format(
+            axeMain.Name, tostring(wasHidden), attachedTo.Name))
+    else
+        print("[Springtrap] топор: " .. (CONFIG.ShowAxe and "в модели не найден" or "отключён в CONFIG"))
+    end
+
+    fatten(model, root, CONFIG.Thickness)
+    local rig = buildRig(model, root)
+
+    -- детали, не привязанные к ригу — привариваем к ближайшей кости
+    for _, p in ipairs(model:GetDescendants()) do
+        if p:IsA("BasePart") and not rig.rest[p] and not isAxe[p] then
+            local attached = false
+            for _, d in ipairs(model:GetDescendants()) do
+                if (d:IsA("JointInstance") or d:IsA("WeldConstraint")) and (d.Part0 == p or d.Part1 == p) and d.Part0 and d.Part1 then
+                    attached = true
+                    break
+                end
+            end
+            if not attached then
+                local best, bd = root, math.huge
+                for q in pairs(rig.rest) do
+                    local d = (q.Position - p.Position).Magnitude
+                    if q ~= root and d < bd then best, bd = q, d end
+                end
+                local wc = Instance.new("WeldConstraint")
+                wc.Part0, wc.Part1 = best, p
+                wc.Parent = p
+            end
+        end
+    end
+
+    -- хватает свободной рукой (той, где нет топора)
+    GR = (axeSide == "Right") and "Left" or "Right"
+    OT = (GR == "Right") and "Left" or "Right"
+
+    -- поправка T-позы: считаем, что в покое руки/ноги должны смотреть вниз
+    table.clear(fix)
+    local function calcFix(name, childName)
+        local j, cj = rig.joints[name], rig.joints[childName]
+        if not j then return end
+        local dir = (cj and cj.pivot or rig.rest[j.part].Position) - j.pivot
+        if dir.Magnitude < 0.05 then return end
+        dir = dir.Unit
+        local down = V3(0, -1, 0)
+        local ang = math.acos(math.clamp(dir:Dot(down), -1, 1))
+        local axis = dir:Cross(down)
+        if ang > rad(35) and axis.Magnitude > 1e-3 then
+            fix[name] = CFrame.fromAxisAngle(axis.Unit, ang)
+        end
+    end
+    calcFix("LeftArm", "LeftArmLower"); calcFix("RightArm", "RightArmLower")
+    calcFix("LeftLeg", "LeftLowerLeg"); calcFix("RightLeg", "RightLowerLeg")
+
+    local jC, jL = rig.joints.SpringTorso, rig.joints.LowerTorso
+    spineMode = (jC and jC.parent.Name == "LowerTorso") and "A" or ((jL and jL.parent.Name == "SpringTorso") and "B" or "A")
+
+    -- посадка на персонажа: ступни морфа на уровне пола
+    local groundDist = hrp.Size.Y / 2 + hum.HipHeight
+    if hum.RigType == Enum.HumanoidRigType.R6 then
+        local leg = char:FindFirstChild("Left Leg")
+        groundDist += leg and leg.Size.Y or 2
+    end
+    local baseMount = CFrame.new(0, -groundDist - minY, 0) * A(0, rad(CONFIG.YawFix), 0)
+    local mount = Instance.new("Weld")
+    mount.Name = "MorphMount"
+    mount.Part0, mount.Part1, mount.C0 = hrp, root, baseMount
+    mount.Parent = root
+    model.Parent = FX
+
+    savedCam.offset = hum.CameraOffset
+    local camY = math.max(0, baseMount.Position.Y + maxY - 2.1) -- камера на уровне глаз морфа
+    if CONFIG.ThirdPerson then
+        savedCam.max, savedCam.mode = LP.CameraMaxZoomDistance, LP.CameraMode
+        pcall(function()
+            LP.CameraMode = Enum.CameraMode.Classic
+            LP.CameraMaxZoomDistance = math.max(LP.CameraMaxZoomDistance, 45)
+        end)
+    end
+
+    baseSpeed = hum.WalkSpeed > 0 and hum.WalkSpeed or 16
+    local height = maxY - minY
+    Morph = {
+        model = model, rig = rig, root = root, mount = mount, baseMount = baseMount,
+        char = char, hum = hum, hrp = hrp, head = findPart(model, "Head"),
+        handGR = hand(GR),
+        foreGR = findPart(model, GR .. "ArmLower") or findPart(model, GR .. "Arm") or root,
+        height = height, reach = math.max(10, height * 1.3), camOffset = V3(0, camY, 0),
+    }
+
+    hideOwn(char)
+    bind(hum.Died, function() destroyMorph() end, morphConns)
+    print(("[Springtrap] морф готов: суставов %d, рост %.1f, хватает %s рукой"):format(
+        #rig.list, height, GR == "Right" and "правой" or "левой"))
+end
+
+----------------------------------------------------------------------------------------------------
+-- Движок способностей
+----------------------------------------------------------------------------------------------------
+local hooks, stepHooks = {}, {}
+local abilityToken = 0
+local cooldowns = {}
+
+local function W(t)
+    local tok = abilityToken
+    task.wait(t)
+    if tok ~= abilityToken or not Morph then error(CANCEL) end
+end
+
+local function hook(fn, stepped)
+    local tbl = stepped and stepHooks or hooks
+    tbl[fn] = true
+    if runCtx then runCtx.hooks[fn] = true end
+    return fn
+end
+local function unhook(fn)
+    if fn then hooks[fn], stepHooks[fn] = nil, nil end
+end
+
+local function setFrozen(v)
+    if not Morph or frozen == v then return end
+    frozen = v
+    local hum = Morph.hum
+    if v then
+        if not sprinting then baseSpeed = hum.WalkSpeed > 0 and hum.WalkSpeed or baseSpeed end
+        Morph.savedJP, Morph.savedJH = hum.JumpPower, hum.JumpHeight
+        hum.WalkSpeed, hum.JumpPower, hum.JumpHeight = 0, 0, 0
+    else
+        hum.WalkSpeed = sprinting and CONFIG.RunSpeed or baseSpeed
+        hum.JumpPower, hum.JumpHeight = Morph.savedJP or hum.JumpPower, Morph.savedJH or hum.JumpHeight
+    end
+end
+
+local function setSprint(v)
+    if sprinting == v then return end
+    sprinting = v
+    if not Morph or frozen then return end
+    local hum = Morph.hum
+    if v then
+        baseSpeed = hum.WalkSpeed > 0 and hum.WalkSpeed or baseSpeed
+        hum.WalkSpeed = CONFIG.RunSpeed
+    else
+        hum.WalkSpeed = baseSpeed
+    end
+end
+
+-- Поза: gr/ot = рука хвата / вторая: {подъём вперёд, внутрь, в сторону, локоть}
+--       spine = {наклон назад, поворот по ходу броска, вбок}, head = {вверх, вбок, наклон}
+local function mk(s)
+    local p = {}
+    local function setArm(side, a)
+        p[side .. "Arm"] = arm(rad(a[1]), rad(a[2] or 0), rad(a[3] or 0), SGN[side])
+        p[side .. "ArmLower"] = A(rad(a[4] or 0), 0, 0)
+    end
+    if s.gr then setArm(GR, s.gr) end
+    if s.ot then setArm(OT, s.ot) end
+    if s.spine then p.Spine = A(rad(s.spine[1]), rad((s.spine[2] or 0) * SGN[GR]), rad(s.spine[3] or 0)) end
+    if s.head then p.Head = A(rad(s.head[1]), rad(s.head[2] or 0), rad(s.head[3] or 0)) end
+    p.Body = s.body
+    return p
+end
+
+local function setPose(logical, speed)
+    local raw, body = expand(logical)
+    override, overrideBody, overrideSpeed = raw, body, speed or 12
+end
+local function P(spec, speed) setPose(mk(spec), speed) end
+
+local function findTargets(range, minDot, maxN)
+    local o, look = Morph.hrp.Position, flat(Morph.hrp.CFrame.LookVector)
+    local res = {}
+    for _, t in ipairs(allTargets()) do
+        local d = t.root.Position - o
+        local dist = d.Magnitude
+        if dist <= range and (dist < 3 or flat(d):Dot(look) >= minDot) then
+            t.dist = dist
+            table.insert(res, t)
+        end
+    end
+    table.sort(res, function(a, b) return a.dist < b.dist end)
+    if maxN then
+        for i = #res, maxN + 1, -1 do res[i] = nil end
+    end
+    return res
+end
+
+-- клон держится шеей в руке. mode "up" — висит лицом к тебе, "club" — тело вытянуто вдоль руки
+local function hold(c)
+    local head = c.head
+    local rel = (head and c.rig.rest[head]) and (c.rig.rest[head].Position - V3(0, head.Size.Y * 0.4, 0)) or V3(0, 1.5, 0)
+    return hook(function(dt)
+        local M = Morph
+        if not M or not c.model.Parent or c.released then return end
+        local handPos = M.handGR.Position
+        local rot
+        if c.mode == "club" then
+            local dir = handPos - M.foreGR.Position
+            dir = dir.Magnitude > 0.05 and dir.Unit or V3(0, -1, 0)
+            local up = -dir
+            local right = up:Cross(M.hrp.CFrame.LookVector)
+            right = right.Magnitude > 0.05 and right.Unit or M.hrp.CFrame.RightVector
+            rot = CFrame.fromMatrix(ZERO, right, up)
+        else
+            rot = (M.hrp.CFrame * A(0, math.pi, 0)).Rotation
+        end
+        if c.jitter > 0 then
+            rot = rot * A(rad(rnd(-c.jitter, c.jitter)), 0, rad(rnd(-c.jitter, c.jitter)))
+        end
+        local target = CFrame.new(handPos - rot:VectorToWorldSpace(rel)) * rot
+        c.root.CFrame = c.root.CFrame:Lerp(target, math.min(1, dt * c.follow))
+    end)
+end
+
+-- цель дёргается в руке
+local function struggle(c)
+    local t0 = os.clock()
+    return hook(function()
+        local t = os.clock() - t0
+        for i, j in ipairs(c.arms) do
+            if j.motor.Parent then j.motor.Transform = toRaw(j, A(rad(150) + rad(14) * math.sin(t * 19 + i * 2), 0, 0)) end
+        end
+        for i, j in ipairs(c.legs) do
+            if j.motor.Parent then j.motor.Transform = toRaw(j, A(rad(28) * math.sin(t * 15 + i * math.pi), 0, 0)) end
+        end
+    end, true)
+end
+
+local function limp(c)
+    for _, j in ipairs(c.arms) do
+        if j.motor.Parent then j.motor.Transform = toRaw(j, A(rad(8), 0, 0)) end
+    end
+    for _, j in ipairs(c.legs) do
+        if j.motor.Parent then j.motor.Transform = ID end
+    end
+end
+
+-- общий старт всех захватов: тянется рукой, хватает ближайшую цель перед собой
+local function grabStart()
+    local t = findTargets(Morph.reach, 0.2, 1)[1]
+    P({ gr = { 80, 5, 5, 10 }, spine = { -8, 10 } }, 16)
+    W(0.2)
+    local c = grab(t)
+    if not c then
+        W(0.25)
+        return nil
+    end
+    setFrozen(true)
+    c.hHold, c.hStr = hold(c), struggle(c)
+    return c
+end
+
+local function look() return flat(Morph.hrp.CFrame.LookVector) end
+
+----------------------------------------------------------------------------------------------------
+-- Способности
+----------------------------------------------------------------------------------------------------
+local Abilities = {}
+local function ability(key, name, cd, fn)
+    local ab = { key = key, name = name, cd = cd, fn = fn }
+    table.insert(Abilities, ab)
+    return ab
+end
+
+-- ЛКМ — удар лапой: сносит ХП, не убивает
+local clickSide = "Right"
+local Click = ability(nil, "Удар", 0.12, function()
+    local side = clickSide
+    clickSide = (side == "Right") and "Left" or "Right"
+    local s = SGN[side]
+    setPose({
+        [side .. "Arm"] = arm(rad(70), rad(-55), rad(35), s),
+        [side .. "ArmLower"] = A(rad(40), 0, 0),
+        Spine = A(rad(-4), rad(-28 * s), 0),
+    }, 22)
+    W(0.1)
+    setPose({
+        [side .. "Arm"] = arm(rad(80), rad(65), rad(5), s),
+        [side .. "ArmLower"] = A(rad(10), 0, 0),
+        Spine = A(rad(-12), rad(32 * s), 0),
+    }, 34)
+    W(0.07)
+    for _, t in ipairs(findTargets(Morph.reach * 0.85, 0.3, 2)) do
+        damage(t, CONFIG.ClickDamage, false)
+        flash(t.char)
+        shake(0.25, 0.12)
+    end
+    W(0.16)
+end)
+
+-- Z — 6 раз бьёт об землю и швыряет
+ability(Enum.KeyCode.Z, "Об землю", 5, function()
+    local c = grabStart()
+    if not c then return end
+    P({ gr = { 105, 5, 5, 5 }, spine = { 5, 0 } }, 9)
+    W(0.45)
+    c.mode, c.follow = "club", 26
+    local per = CONFIG.MaxHP / 7
+    for i = 1, 6 do
+        P({ gr = { 172, 0, 6, 8 }, ot = { -25, 0, 25, 25 }, spine = { 12, -8 }, head = { 8 } }, 15)   -- замах
+        W(0.2)
+        P({ gr = { 38, 6, 0, 4 }, ot = { -35, 0, 20, 30 }, spine = { -30, 10 }, head = { -12 },
+            body = CFrame.new(0, -0.35, 0) }, 30)                                                       -- удар об землю
+        W(0.13)
+        dustRing(c.torso.Position, 9)
+        shake(0.6, 0.2)
+        damage(c.target, per, false)
+        flash(c.model)
+        if i == 1 then
+            unhook(c.hStr)
+            limp(c)
+        end
+        W(0.07)
+    end
+    P({ gr = { 150, -35, 20, 30 }, spine = { 10, -25 } }, 13)
+    W(0.26)
+    P({ gr = { 62, 30, 0, 0 }, spine = { -18, 28 } }, 34)
+    W(0.07)
+    unhook(c.hHold)
+    c:release(look() * 58 + UP * 24)
+    damage(c.target, 9999, true)
+    finish(c, true, CONFIG.KillReturn)
+    W(0.45)
+end)
+
+-- X — подносит к пасти и кусает
+ability(Enum.KeyCode.X, "Укус", 5, function()
+    local c = grabStart()
+    if not c then return end
+    P({ gr = { 95, 5, 5, 5 }, spine = { 4, 0 } }, 9)
+    W(0.4)
+    local near = { 120, 28, 0, 95 }
+    P({ gr = near, spine = { -6, 6 }, head = { -8 } }, 8)
+    W(0.5)
+    for i = 1, 4 do
+        P({ gr = near, spine = { -16, 6 }, head = { -30 } }, 26)
+        W(0.11)
+        shake(0.35, 0.12)
+        damage(c.target, CONFIG.MaxHP / 4, i == 4)
+        flash(c.model)
+        if i == 2 then
+            unhook(c.hStr)
+            limp(c)
+        end
+        P({ gr = near, spine = { -4, 6 }, head = { 6 } }, 14)
+        W(0.2)
+    end
+    W(0.25)
+    P({ gr = { 70, 5, 10, 10 }, spine = { 0, 0 } }, 8)
+    W(0.3)
+    unhook(c.hHold)
+    c:release(ZERO)
+    finish(c, true, CONFIG.KillReturn)
+    W(0.4)
+end)
+
+-- C — удушение: сжимает, сворачивает шею, отпускает
+ability(Enum.KeyCode.C, "Удушение", 5, function()
+    local c = grabStart()
+    if not c then return end
+    P({ gr = { 118, 5, 6, 5 }, spine = { 6, 0 }, head = { 8 } }, 7)
+    W(0.6)
+    for i = 1, 4 do
+        c.jitter = i * 1.5 -- трясёт всё сильнее
+        damage(c.target, CONFIG.MaxHP / 6, false)
+        W(0.32)
+    end
+    c.jitter = 0
+    unhook(c.hStr)
+    limp(c)
+    if c.headJ and c.headJ.motor.Parent then
+        c.headJ.motor.Transform = toRaw(c.headJ, A(0, rad(25), rad(62)))
+    end
+    P({ gr = { 118, 12, 6, 5 }, spine = { 6, 8 }, head = { 8 } }, 30)
+    shake(0.5, 0.15)
+    flash(c.model)
+    damage(c.target, 9999, true)
+    W(0.55)
+    unhook(c.hHold)
+    c:release(ZERO)
+    finish(c, true, CONFIG.KillReturn)
+    W(0.4)
+end)
+
+-- V — бросок далеко: не убивает, сносит ХП, через ThrowReturn сек цель возвращается
+ability(Enum.KeyCode.V, "Бросок", 4, function()
+    local c = grabStart()
+    if not c then return end
+    P({ gr = { 110, 5, 5, 5 }, spine = { 5, 0 } }, 9)
+    W(0.4)
+    c.mode, c.follow = "club", 24
+    P({ gr = { 165, -35, 22, 40 }, spine = { 14, -30 }, head = { 6 } }, 10)
+    W(0.38)
+    P({ gr = { 68, 28, 0, 0 }, spine = { -22, 30 }, body = CFrame.new(0, -0.2, 0) }, 36)
+    W(0.07)
+    unhook(c.hHold)
+    unhook(c.hStr)
+    c:release(look() * 125 + UP * 42)
+    damage(c.target, CONFIG.ThrowDamage, false)
+    finish(c, false, CONFIG.ThrowReturn)
+    shake(0.4, 0.2)
+    W(0.45)
+end)
+
+local function runAbility(ab)
+    if busy or not Morph then return end
+    if (cooldowns[ab] or 0) > os.clock() then return end
+    busy = true
+    abilityToken += 1
+    local ctx = { hooks = {}, clones = {} }
+    runCtx = ctx
+    task.spawn(function()
+        local ok, err = pcall(ab.fn)
+        if not ok and err ~= CANCEL then warn("[Springtrap] " .. ab.name .. ": " .. tostring(err)) end
+        for h in pairs(ctx.hooks) do unhook(h) end
+        for _, c in ipairs(ctx.clones) do
+            if not c.released then -- способность прервалась — отпускаем и скоро возвращаем цель
+                pcall(c.release, c, ZERO)
+                pcall(finish, c, false, 5)
+            end
+        end
+        override, overrideBody = nil, nil
+        setFrozen(false)
+        cooldowns[ab] = os.clock() + ab.cd
+        busy = false
+    end)
+end
+
+----------------------------------------------------------------------------------------------------
+-- Кнопки для телефона
+----------------------------------------------------------------------------------------------------
+local gui
+local function buildUI()
+    local show = CONFIG.ShowButtons == true or (CONFIG.ShowButtons == "auto" and UIS.TouchEnabled)
+    if not show then return end
+    gui = Instance.new("ScreenGui")
+    gui.Name = "SpringtrapUI"
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 50
+    local parented = false
+    if typeof(gethui) == "function" then
+        parented = pcall(function() gui.Parent = gethui() end)
+    end
+    if not parented then
+        parented = pcall(function() gui.Parent = game:GetService("CoreGui") end)
+    end
+    if not parented then gui.Parent = LP:WaitForChild("PlayerGui") end
+
+    local frame = Instance.new("Frame")
+    frame.AnchorPoint = Vector2.new(1, 0.5)
+    frame.Position = UDim2.new(1, -8, 0.42, 0)
+    frame.Size = UDim2.new(0, 3 * 70, 0, 2 * 70)
+    frame.BackgroundTransparency = 1
+    frame.Parent = gui
+    local grid = Instance.new("UIGridLayout")
+    grid.CellSize = UDim2.new(0, 64, 0, 64)
+    grid.CellPadding = UDim2.new(0, 6, 0, 6)
+    grid.FillDirectionMaxCells = 3
+    grid.HorizontalAlignment = Enum.HorizontalAlignment.Right
+    grid.SortOrder = Enum.SortOrder.LayoutOrder
+    grid.Parent = frame
+
+    local function button(text, order)
+        local b = Instance.new("TextButton")
+        b.Text = text
+        b.LayoutOrder = order
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 12
+        b.TextWrapped = true
+        b.TextColor3 = Color3.fromRGB(200, 255, 180)
+        b.BackgroundColor3 = Color3.fromRGB(28, 36, 22)
+        b.BackgroundTransparency = 0.25
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 10)
+        corner.Parent = b
+        b.Parent = frame
+        return b
+    end
+
+    local btns = {}
+    for i, ab in ipairs(Abilities) do
+        local b = button(ab.key and (ab.key.Name .. "\n" .. ab.name) or ab.name:upper(), i)
+        bind(b.MouseButton1Down, function() runAbility(ab) end)
+        btns[ab] = b
+    end
+    local runBtn = button("БЕГ", 100)
+    bind(runBtn.MouseButton1Down, function()
+        setSprint(not sprinting)
+        runBtn.BackgroundColor3 = sprinting and Color3.fromRGB(70, 110, 40) or Color3.fromRGB(28, 36, 22)
+    end)
+
+    local toggle = Instance.new("TextButton")
+    toggle.Text = "≡"
+    toggle.Font = Enum.Font.GothamBold
+    toggle.TextSize = 18
+    toggle.TextColor3 = Color3.fromRGB(200, 255, 180)
+    toggle.BackgroundColor3 = Color3.fromRGB(28, 36, 22)
+    toggle.BackgroundTransparency = 0.25
+    toggle.AnchorPoint = Vector2.new(1, 0)
+    toggle.Position = UDim2.new(1, -8, 0, 8)
+    toggle.Size = UDim2.new(0, 34, 0, 34)
+    toggle.Parent = gui
+    bind(toggle.MouseButton1Down, function() frame.Visible = not frame.Visible end)
+
+    task.spawn(function()
+        while gui.Parent do
+            local now = os.clock()
+            for ab, b in pairs(btns) do
+                b.TextTransparency = ((cooldowns[ab] or 0) > now) and 0.6 or 0
+            end
+            task.wait(0.1)
+        end
+    end)
+end
+
+----------------------------------------------------------------------------------------------------
+-- Ввод
+----------------------------------------------------------------------------------------------------
+local keyMap = {}
+for _, ab in ipairs(Abilities) do
+    if ab.key then keyMap[ab.key] = ab end
+end
+
+bind(UIS.InputBegan, function(input, gp)
+    if UIS:GetFocusedTextBox() then return end
+    if input.KeyCode == Enum.KeyCode.LeftControl or input.KeyCode == Enum.KeyCode.RightControl then
+        setSprint(true)
+        return
+    end
+    if gp then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        runAbility(Click)
+        return
+    end
+    local ab = keyMap[input.KeyCode]
+    if ab then runAbility(ab) end
+end)
+bind(UIS.InputEnded, function(input)
+    if input.KeyCode == Enum.KeyCode.LeftControl or input.KeyCode == Enum.KeyCode.RightControl then
+        setSprint(false)
+    end
+end)
+
+----------------------------------------------------------------------------------------------------
+-- Основные циклы
+----------------------------------------------------------------------------------------------------
+bind(RunService.Stepped, function(_, dt)
+    if not Morph then return end
+    local ok, err = pcall(updateAnim, dt)
+    if not ok then warn("[Springtrap] anim: " .. tostring(err)) end
+    for fn in pairs(table.clone(stepHooks)) do
+        local ok2, e2 = pcall(fn, dt)
+        if not ok2 then stepHooks[fn] = nil; warn("[Springtrap] hook: " .. tostring(e2)) end
+    end
+end)
+
+local slowTick = 0
+bind(RunService.Heartbeat, function(dt)
+    for fn in pairs(table.clone(hooks)) do
+        local ok, err = pcall(fn, dt)
+        if not ok then hooks[fn] = nil; warn("[Springtrap] hook: " .. tostring(err)) end
+    end
+
+    slowTick += dt
+    if slowTick > 0.5 then
+        slowTick = 0
+        local now = os.clock()
+        for ch, rec in pairs(table.clone(hidden)) do
+            if not ch.Parent then
+                hidden[ch] = nil
+                if rec.clone and rec.clone.model.Parent then rec.clone.model:Destroy() end
+            elseif rec.returnAt and now > rec.returnAt then
+                bringBack(ch)
+            else
+                rec.reapply()
+            end
+        end
+        for ch, r in pairs(hpRec) do
+            if not ch.Parent then
+                r.bb:Destroy()
+                hpRec[ch] = nil
+            end
+        end
+        for inst in pairs(hiddenOwn) do
+            if inst.Parent and inst.Transparency ~= 1 then inst.Transparency = 1 end
+        end
+    end
+end)
+
+bind(RunService.RenderStepped, function()
+    if not Morph then return end
+    local off = Morph.camOffset
+    local now = os.clock()
+    if now < shakeEnd then
+        off += rng:NextUnitVector() * shakeMag * ((shakeEnd - now) / shakeDur)
+    end
+    Morph.hum.CameraOffset = off
+    local cam = workspace.CurrentCamera
+    if cam and Morph.head and Morph.head:IsA("BasePart") then
+        local firstPerson = (cam.CFrame.Position - cam.Focus.Position).Magnitude < 1.2
+        Morph.head.LocalTransparencyModifier = firstPerson and 1 or 0
+    end
+end)
+
+----------------------------------------------------------------------------------------------------
+-- Старт
+----------------------------------------------------------------------------------------------------
+genv.SpringtrapMorph = {
+    Destroy = function()
+        abilityToken += 1
+        destroyMorph()
+        disconnectAll(conns)
+        for ch in pairs(table.clone(hidden)) do pcall(bringBack, ch) end
+        if gui then gui:Destroy() end
+        FX:Destroy()
+    end,
+}
+buildUI()
+
+bind(LP.CharacterAdded, function(char)
+    abilityToken += 1
+    task.wait(0.5)
+    local ok, err = pcall(createMorph, char)
+    if not ok then warn("[Springtrap] morph: " .. tostring(err)) end
+end)
+if LP.Character then
+    local ok, err = pcall(createMorph, LP.Character)
+    if not ok then
+        warn("[Springtrap] morph: " .. tostring(err))
+        notify("Ошибка морфа, смотри F9")
+    end
+end
+
+notify("Морф готов. ЛКМ — удар, Ctrl — бег, Z X C V — способности")
